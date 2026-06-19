@@ -16,3 +16,7 @@ build/
 # OS
 Thumbs.db
 .DS_Store
+
+# Scraper data
+backend/playwright_user_data/
+backend/scratch/

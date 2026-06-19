@@ -37,10 +37,14 @@ export interface Optimization {
 }
 
 export interface AgentResult {
-  zomato: PlatformResult
-  swiggy: PlatformResult
-  eatsure: PlatformResult
-  decision: AgentDecision
+  mode?: 'chat' | 'account_summary' | 'platform_summary' | 'comparison'
+  answer?: string
+  target_platforms?: string[]
+  sessions?: Record<string, unknown>
+  zomato?: PlatformResult
+  swiggy?: PlatformResult
+  eatsure?: PlatformResult
+  decision?: AgentDecision
   optimization?: Optimization
 }
 

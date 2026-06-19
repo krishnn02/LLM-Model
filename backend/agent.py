@@ -1,33 +1,34 @@
 """
 OmniFood Agent - LangGraph ReAct State Machine
-Orchestrates intent parsing, parallel scraping, and price optimization.
+Orchestrates intent parsing, parallel scraping, and price reporting.
 """
 
 import asyncio
 import json
 import logging
 import os
-from typing import Dict, TypedDict, Any, AsyncGenerator, Optional
+import re
+from typing import Dict, TypedDict, Any, AsyncGenerator, Optional, List
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 
 from scraper import BrowserManager
 from config import get_settings
+from session_manager import get_session_manager
 
 logger = logging.getLogger("omnifood.agent")
 
-# ── LLM Initialization ──
+
+# ── LLM Init ─────────────────────────────────────────────────────────────────
 def get_llm():
-    """Initialize the LLM based on configuration."""
     settings = get_settings()
     provider = settings.llm_provider.lower()
-    
+
     if provider == "openai" and settings.openai_api_key:
         from langchain_openai import ChatOpenAI
-        # If openrouter is used, ensure we pass a supported model name
         model_name = "openai/gpt-4o-mini" if "openrouter" in settings.openai_base_url else "gpt-4o-mini"
-        kwargs = {
+        kwargs: Dict[str, Any] = {
             "model": model_name,
             "temperature": 0,
             "api_key": settings.openai_api_key,
@@ -35,260 +36,326 @@ def get_llm():
         if settings.openai_base_url:
             kwargs["base_url"] = settings.openai_base_url
         return ChatOpenAI(**kwargs)
-    elif provider == "google" and settings.google_api_key:
+
+    if provider == "google" and settings.google_api_key:
         from langchain_google_genai import ChatGoogleGenerativeAI
         return ChatGoogleGenerativeAI(
             model="gemini-1.5-flash",
             temperature=0,
             google_api_key=settings.google_api_key,
         )
-    else:
-        logger.warning("No LLM API key configured. Using rule-based intent parser.")
-        return None
 
-# ── Agent State ──
+    logger.warning("No LLM API key configured — using rule-based parser.")
+    return None
+
+
+# ── Agent State ───────────────────────────────────────────────────────────────
 class AgentState(TypedDict):
     query: str
     intent: Dict[str, Any]
+    target_platforms: List[str]
+    browser_manager: Any
     zomato_result: Dict[str, Any]
     swiggy_result: Dict[str, Any]
     eatsure_result: Dict[str, Any]
     optimization: Dict[str, Any]
     final_decision: Dict[str, Any]
-    logs: list[Dict[str, str]]
+    logs: List[Dict[str, str]]
 
-# ── Log message helper ──
+
 def _log(message: str) -> Dict[str, str]:
     return {"type": "log", "message": message}
 
-# ──────────────────────────────────────────────
-# NODE 1: Intent Extraction
-# ──────────────────────────────────────────────
-INTENT_SYSTEM_PROMPT = """You are a food order intent parser. Extract structured information from the user's natural language query about ordering food.
 
-Return ONLY valid JSON with these fields:
+# ── Query Classifier ─────────────────────────────────────────────────────────
+def _classify_query(query: str) -> Dict[str, Any]:
+    """
+    Classify the user's query into one of:
+      food_lookup  — needs live price scraping
+      account_summary — session status questions
+      chat         — clarification needed or general question
+      general_chat — fully off-topic
+    """
+    q = query.lower().strip()
+
+    # ── Account / session questions ────────────────────────────────────────
+    account_keywords = [
+        "my account", "account details", "session", "connected accounts",
+        "login status", "linked account", "my zomato", "my swiggy",
+        "my eatsure", "profile details",
+    ]
+    if any(kw in q for kw in account_keywords):
+        platforms = [p for p in ("zomato", "swiggy", "eatsure") if p in q]
+        return {"mode": "account_summary", "platforms": platforms}
+
+    # ── Price / menu / food lookup patterns ───────────────────────────────
+    # "what is price of X in Y"   "price of matar paneer in GuruKripa"
+    # "how much is X at Y"         "order X from Y"
+    price_patterns = [
+        r"price\s+of\b",
+        r"how\s+much\s+(is|does|for)\b",
+        r"cost\s+of\b",
+        r"\bprice\b.*\bin\b",
+        r"\bin\b.*\bprice\b",
+        r"what.*\bcost\b",
+        r"menu\s+(price|item)",
+    ]
+    food_action_keywords = [
+        "order", "deliver", "checkout", "cart", "compare",
+        "best deal", "cheapest", "from restaurant", "on zomato",
+        "on swiggy", "on eatsure",
+    ]
+    restaurant_hint = bool(re.search(
+        r'\b(restaurant|dhaba|cafe|kitchen|hotel|food|eatery)\b', q
+    ))
+    has_price_question = any(re.search(p, q) for p in price_patterns)
+    has_food_action = any(kw in q for kw in food_action_keywords)
+    # Explicit "from <place>" or "in <place>" with food context
+    location_ref = bool(re.search(r'\b(from|in|at)\s+[A-Z][a-z]', query))
+
+    platform_filter = [p for p in ("zomato", "swiggy", "eatsure") if p in q]
+
+    if has_price_question or has_food_action or restaurant_hint or location_ref:
+        return {"mode": "food_lookup", "platforms": platform_filter}
+
+    # ── General chat fallback ──────────────────────────────────────────────
+    return {"mode": "general_chat", "platforms": []}
+
+
+# ── General chat via LLM ─────────────────────────────────────────────────────
+async def _answer_general_query(query: str) -> str:
+    llm = get_llm()
+    if llm:
+        try:
+            response = await llm.ainvoke([
+                SystemMessage(content=(
+                    "You are OmniFood, an AI assistant that helps users find the best food deals "
+                    "across Zomato, Swiggy, and EatSure. Answer concisely. If the user asks about "
+                    "a restaurant price or menu item, tell them to include the restaurant name and "
+                    "city so you can look it up live."
+                )),
+                HumanMessage(content=query),
+            ])
+            return str(response.content).strip()
+        except Exception as e:
+            logger.error(f"LLM answer failed: {e}")
+    return (
+        "I'm OmniFood — I can fetch live prices from Zomato and Swiggy. "
+        "Try: 'What is the price of Matar Paneer in GuruKripa Restaurant Indore?'"
+    )
+
+
+# ── Account summary ──────────────────────────────────────────────────────────
+def _build_account_summary(platform_filter: Optional[List[str]] = None) -> Dict[str, Any]:
+    sm = get_session_manager()
+    sessions = sm.get_all_sessions_status()
+    connected, disconnected = [], []
+    for key, session in sessions.items():
+        if platform_filter and key not in platform_filter:
+            continue
+        if session.get("connected"):
+            connected.append(f"{session['platform']}: connected")
+        else:
+            disconnected.append(f"{session['platform']}: not connected")
+
+    answer = "Linked accounts: " + ", ".join(connected) + "." if connected else \
+             "No linked food delivery accounts saved on this machine."
+    if disconnected:
+        answer += " Not linked: " + ", ".join(disconnected) + "."
+    return {"mode": "account_summary", "answer": answer, "sessions": sessions}
+
+
+# ── NODE 1: Intent Extraction ─────────────────────────────────────────────────
+INTENT_SYSTEM_PROMPT = """You are a food order intent parser for an Indian food delivery assistant.
+
+Extract structured JSON from the user's query. Return ONLY valid JSON — no markdown, no explanation.
+
+Schema:
 {
-  "restaurant": "restaurant name (string, or null if not specified)",
+  "restaurant": "restaurant name or null",
   "items": [{"name": "item name", "quantity": 1}],
-  "delivery_address": "address or pincode (string, or null if not specified)",
-  "city": "city name (string, or null if not specified)"
+  "delivery_address": "address, pincode, or null",
+  "city": "city name or null",
+  "mode": "price_query | order | compare"
 }
 
-Rules:
-- If the user says "2 Butter Chicken", that means quantity 2.
-- If no quantity is specified, assume 1.
-- Extract the city from the address if possible.
-- If the user mentions a pincode, use it as delivery_address.
-- Be flexible with restaurant names — extract the closest match.
+mode rules:
+- price_query: user wants to know the price of a specific item
+- order: user wants to place/compare an actual order
+- compare: user wants to compare prices across platforms
 
 Examples:
-"2 Butter Chicken + Naan from Punjabi Tadka to 400001" →
-{"restaurant": "Punjabi Tadka", "items": [{"name": "Butter Chicken", "quantity": 2}, {"name": "Naan", "quantity": 1}], "delivery_address": "400001", "city": "Mumbai"}
+"What is price of matar paneer in GuruKripa Restaurant Indore?" →
+{"restaurant":"GuruKripa Restaurant","items":[{"name":"Matar Paneer","quantity":1}],"delivery_address":null,"city":"Indore","mode":"price_query"}
 
-"Get me a Margherita Pizza from Dominos" →
-{"restaurant": "Dominos", "items": [{"name": "Margherita Pizza", "quantity": 1}], "delivery_address": null, "city": null}
+"2 Butter Chicken + Naan from Punjabi Tadka to 400001" →
+{"restaurant":"Punjabi Tadka","items":[{"name":"Butter Chicken","quantity":2},{"name":"Naan","quantity":1}],"delivery_address":"400001","city":"Mumbai","mode":"order"}
 """
 
+
 def _parse_intent_rule_based(query: str) -> Dict[str, Any]:
-    """
-    Rule-based intent parser as fallback when no LLM is available.
-    Handles common patterns like 'X from Restaurant to Address'.
-    """
-    import re
-    
-    intent = {
-        "restaurant": None,
-        "items": [],
-        "delivery_address": None,
-        "city": None,
+    """Fallback rule-based parser."""
+    intent: Dict[str, Any] = {
+        "restaurant": None, "items": [], "delivery_address": None, "city": None, "mode": "price_query"
     }
-    
-    query_lower = query.lower().strip()
-    
-    # Extract "from <restaurant>" pattern
-    from_match = re.search(r'\bfrom\s+(.+?)(?:\s+to\s+|\s+deliver|\s*$)', query, re.IGNORECASE)
+
+    # "price of X in RESTAURANT CITY"
+    price_match = re.search(
+        r'price\s+of\s+(.+?)\s+in\s+(.+?)(?:\s*\?|$)', query, re.IGNORECASE
+    )
+    if price_match:
+        item_text = price_match.group(1).strip()
+        rest_city = price_match.group(2).strip()
+        intent["items"] = [{"name": item_text, "quantity": 1}]
+        # Last word is often city if it's a known city
+        parts = rest_city.rsplit(" ", 1)
+        intent["restaurant"] = parts[0] if len(parts) > 1 else rest_city
+        if len(parts) > 1:
+            intent["city"] = parts[1]
+        intent["mode"] = "price_query"
+        return intent
+
+    # "from RESTAURANT to ADDRESS"
+    from_match = re.search(r'\bfrom\s+(.+?)(?:\s+to\s+(.+?))?(?:\s*$)', query, re.IGNORECASE)
     if from_match:
-        intent["restaurant"] = from_match.group(1).strip().rstrip('.')
-    
-    # Extract "to <address>" pattern
-    to_match = re.search(r'\bto\s+(.+?)$', query, re.IGNORECASE)
-    if to_match:
-        intent["delivery_address"] = to_match.group(1).strip().rstrip('.')
-    
-    # Extract items: everything before "from"
-    items_text = query
-    if from_match:
-        items_text = query[:from_match.start()]
-    
-    # Remove common prefixes
-    items_text = re.sub(r'^(get\s+me|order|i\s+want|please\s+get|can\s+you\s+order)\s+', '', items_text, flags=re.IGNORECASE)
-    
-    # Split by '+', ',', 'and'
-    item_parts = re.split(r'\s*[+,]\s*|\s+and\s+', items_text)
-    
-    for part in item_parts:
+        intent["restaurant"] = from_match.group(1).strip()
+        if from_match.group(2):
+            intent["delivery_address"] = from_match.group(2).strip()
+
+    # Items before "from"
+    items_text = query[:from_match.start()].strip() if from_match else query
+    items_text = re.sub(
+        r'^(get\s+me|order|i\s+want|please\s+get|compare)\s+', '', items_text, flags=re.IGNORECASE
+    )
+    for part in re.split(r'\s*[+,]\s*|\s+and\s+', items_text):
         part = part.strip()
         if not part:
             continue
-        # Check for quantity prefix: "2 Butter Chicken"
         qty_match = re.match(r'^(\d+)\s+(.+)', part)
         if qty_match:
-            intent["items"].append({
-                "name": qty_match.group(2).strip(),
-                "quantity": int(qty_match.group(1)),
-            })
+            intent["items"].append({"name": qty_match.group(2).strip(), "quantity": int(qty_match.group(1))})
         elif part:
             intent["items"].append({"name": part, "quantity": 1})
-    
-    # Detect pincode in address
-    if intent["delivery_address"]:
-        pincode_match = re.search(r'\b\d{6}\b', intent["delivery_address"])
-        if pincode_match:
-            # It's a pincode, try to detect city
-            pass
-    
+
+    intent["mode"] = "order"
     return intent
 
 
 async def node_intent(state: AgentState) -> Dict[str, Any]:
-    """Extract structured intent from natural language query using LLM or rule-based fallback."""
     query = state["query"]
     logs = [_log(f"🧠 Parsing intent for: \"{query}\"...")]
-    
+
     llm = get_llm()
     intent = None
-    
+
     if llm:
         try:
-            logs.append(_log("🧠 Using AI to extract restaurant, items, and address..."))
             response = await llm.ainvoke([
                 SystemMessage(content=INTENT_SYSTEM_PROMPT),
                 HumanMessage(content=query),
             ])
-            
-            # Parse LLM response
             content = response.content.strip()
-            # Handle markdown code blocks
             if "```" in content:
-                import re
-                json_match = re.search(r'```(?:json)?\s*(.*?)```', content, re.DOTALL)
-                if json_match:
-                    content = json_match.group(1).strip()
-            
+                m = re.search(r'```(?:json)?\s*(.*?)```', content, re.DOTALL)
+                if m:
+                    content = m.group(1).strip()
             intent = json.loads(content)
-            logs.append(_log(f"🧠 AI Intent Extraction Complete ✓"))
+            logs.append(_log("🧠 AI intent extraction complete ✓"))
         except Exception as e:
             logger.error(f"LLM intent extraction failed: {e}")
-            logs.append(_log(f"🧠 AI extraction failed, using rule-based parser..."))
             intent = None
-    
+
     if intent is None:
         logs.append(_log("🧠 Using rule-based intent parser..."))
         intent = _parse_intent_rule_based(query)
-    
-    # Format items for logging
+
     items_str = ", ".join(
-        f"{item.get('quantity', 1)}x {item['name']}" 
-        for item in intent.get("items", [])
+        f"{it.get('quantity', 1)}x {it['name']}" for it in intent.get("items", [])
     )
-    
     logs.append(_log(
-        f"📋 Restaurant: {intent.get('restaurant', 'Not specified')} | "
-        f"Items: {items_str or 'None detected'} | "
-        f"Address: {intent.get('delivery_address', 'Not specified')}"
+        f"📋 Restaurant: {intent.get('restaurant') or 'Not specified'} | "
+        f"Items: {items_str or 'None'} | "
+        f"City: {intent.get('city') or 'Not specified'}"
     ))
-    
+
     return {"intent": intent, "logs": logs}
 
 
-# ──────────────────────────────────────────────
-# NODE 2: Parallel Scraping (Fan-Out)
-# ──────────────────────────────────────────────
+# ── NODE 2: Parallel Scraping ─────────────────────────────────────────────────
 async def node_scrape(state: AgentState) -> Dict[str, Any]:
-    """Launch parallel browser workers to scrape Zomato, Swiggy, and EatSure."""
     intent = state["intent"]
-    all_logs = []
-    
-    # Flatten items for scraper (just names list)
-    item_names = []
-    for item in intent.get("items", []):
-        name = item.get("name", "") if isinstance(item, dict) else str(item)
-        qty = item.get("quantity", 1) if isinstance(item, dict) else 1
+    target_platforms = state.get("target_platforms") or ["zomato", "swiggy"]
+    bm = state.get("browser_manager") or BrowserManager()
+    all_logs: List[Dict] = []
+
+    # Flatten item names
+    item_names: List[str] = []
+    for it in intent.get("items", []):
+        name = it.get("name", "") if isinstance(it, dict) else str(it)
+        qty = it.get("quantity", 1) if isinstance(it, dict) else 1
         item_names.extend([name] * qty)
-    
+
     scraper_intent = {
         "restaurant": intent.get("restaurant", ""),
         "items": item_names,
+        "city": intent.get("city", ""),
         "delivery_address": intent.get("delivery_address", ""),
     }
-    
-    all_logs.append(_log("🚀 Launching parallel browser workers for Zomato, Swiggy, and EatSure..."))
-    
-    # Create log collectors for each platform
-    zomato_logs = []
-    swiggy_logs = []
-    eatsure_logs = []
-    
-    async def zomato_log(msg):
-        zomato_logs.append(_log(msg))
-    
-    async def swiggy_log(msg):
-        swiggy_logs.append(_log(msg))
-    
-    async def eatsure_log(msg):
-        eatsure_logs.append(_log(msg))
-    
-    bm = BrowserManager()
-    
-    # Run all three scrapers in parallel
-    z_task = asyncio.create_task(bm.scrape_zomato(scraper_intent, log=zomato_log))
-    s_task = asyncio.create_task(bm.scrape_swiggy(scraper_intent, log=swiggy_log))
-    e_task = asyncio.create_task(bm.scrape_eatsure(scraper_intent, log=eatsure_log))
-    
-    z_result, s_result, e_result = await asyncio.gather(z_task, s_task, e_task, return_exceptions=True)
-    
-    # Handle exceptions
-    if isinstance(z_result, Exception):
-        logger.error(f"Zomato scraper exception: {z_result}")
-        z_result = {
-            "platform": "Zomato", "base_price": 0, "taxes": 0,
-            "discount": 0, "final_total": 0, "delivery_time": "N/A",
-            "error": str(z_result), "membership": None, "coupon_applied": None,
-        }
-    
-    if isinstance(s_result, Exception):
-        logger.error(f"Swiggy scraper exception: {s_result}")
-        s_result = {
-            "platform": "Swiggy", "base_price": 0, "taxes": 0,
-            "discount": 0, "final_total": 0, "delivery_time": "N/A",
-            "error": str(s_result), "membership": None, "coupon_applied": None,
-        }
-    
-    if isinstance(e_result, Exception):
-        logger.error(f"EatSure scraper exception: {e_result}")
-        e_result = {
-            "platform": "EatSure", "base_price": 0, "taxes": 0,
-            "discount": 0, "final_total": 0, "delivery_time": "N/A",
-            "error": str(e_result), "membership": None, "coupon_applied": None,
-        }
-    
-    # Merge logs in interleaved order for better UX
-    max_len = max(len(zomato_logs), len(swiggy_logs), len(eatsure_logs))
-    for i in range(max_len):
-        if i < len(zomato_logs):
-            all_logs.append(zomato_logs[i])
-        if i < len(swiggy_logs):
-            all_logs.append(swiggy_logs[i])
-        if i < len(eatsure_logs):
-            all_logs.append(eatsure_logs[i])
-    
-    all_logs.append(_log(
-        f"✅ Scraping complete — "
-        f"Zomato: ₹{z_result.get('final_total', 0)} | "
-        f"Swiggy: ₹{s_result.get('final_total', 0)} | "
-        f"EatSure: ₹{e_result.get('final_total', 0)}"
-    ))
-    
+
+    pretty = ", ".join(p.title() for p in target_platforms)
+    all_logs.append(_log(f"🚀 Scraping {pretty} for live menu prices..."))
+
+    zomato_logs: List[Dict] = []
+    swiggy_logs: List[Dict] = []
+    eatsure_logs: List[Dict] = []
+
+    async def zlog(m): zomato_logs.append(_log(m))
+    async def slog(m): swiggy_logs.append(_log(m))
+    async def elog(m): eatsure_logs.append(_log(m))
+
+    tasks: Dict[str, Any] = {}
+    if "zomato" in target_platforms:
+        tasks["zomato"] = asyncio.create_task(bm.scrape_zomato(scraper_intent, log=zlog))
+    if "swiggy" in target_platforms:
+        tasks["swiggy"] = asyncio.create_task(bm.scrape_swiggy(scraper_intent, log=slog))
+    if "eatsure" in target_platforms:
+        tasks["eatsure"] = asyncio.create_task(bm.scrape_eatsure(scraper_intent, log=elog))
+
+    results = await asyncio.gather(*tasks.values(), return_exceptions=True) if tasks else []
+    result_map = dict(zip(tasks.keys(), results))
+
+    def safe(key: str, platform_name: str) -> Dict[str, Any]:
+        r = result_map.get(key, None)
+        if r is None or isinstance(r, Exception):
+            err = str(r) if isinstance(r, Exception) else "Not requested"
+            return {"platform": platform_name, "item_prices": {}, "base_price": 0, "taxes": 0,
+                    "discount": 0, "final_total": 0, "delivery_time": "N/A",
+                    "error": err, "membership": None, "coupon_applied": None}
+        return r
+
+    z_result = safe("zomato", "Zomato")
+    s_result = safe("swiggy", "Swiggy")
+    e_result = safe("eatsure", "EatSure")
+
+    # Interleave logs
+    for i in range(max(len(zomato_logs), len(swiggy_logs), len(eatsure_logs))):
+        if i < len(zomato_logs): all_logs.append(zomato_logs[i])
+        if i < len(swiggy_logs): all_logs.append(swiggy_logs[i])
+        if i < len(eatsure_logs): all_logs.append(eatsure_logs[i])
+
+    bits = []
+    if "zomato" in target_platforms:
+        v = z_result.get("final_total", 0)
+        bits.append(f"Zomato: {'₹' + str(v) if v else 'N/A'}")
+    if "swiggy" in target_platforms:
+        v = s_result.get("final_total", 0)
+        bits.append(f"Swiggy: {'₹' + str(v) if v else 'N/A'}")
+    if "eatsure" in target_platforms:
+        v = e_result.get("final_total", 0)
+        bits.append(f"EatSure: {'₹' + str(v) if v else 'N/A'}")
+
+    all_logs.append(_log("✅ Scraping complete — " + " | ".join(bits)))
+
     return {
         "zomato_result": z_result,
         "swiggy_result": s_result,
@@ -297,103 +364,59 @@ async def node_scrape(state: AgentState) -> Dict[str, Any]:
     }
 
 
-# ──────────────────────────────────────────────
-# NODE 3: Price Optimizer
-# ──────────────────────────────────────────────
+# ── NODE 3: Optimizer / Formatter ────────────────────────────────────────────
 async def node_optimizer(state: AgentState) -> Dict[str, Any]:
-    """
-    Compare totals across all platforms and optimize.
-    Key feature: if a cart is ₹460 and a ₹100 discount starts at ₹500,
-    suggest a cheap filler item.
-    """
-    z_res = state.get("zomato_result", {})
-    s_res = state.get("swiggy_result", {})
-    e_res = state.get("eatsure_result", {})
-    logs = [_log("🧠 Optimizer: Analyzing price data across platforms...")]
-    
+    intent = state.get("intent", {})
+    z = state.get("zomato_result", {})
+    s = state.get("swiggy_result", {})
+    e = state.get("eatsure_result", {})
+    target_platforms = state.get("target_platforms") or ["zomato", "swiggy"]
+    logs = [_log("🧠 Analyzing scraped data...")]
+
     platforms = []
-    
-    # Build platform comparison list (skip errored ones)
-    if z_res.get("final_total", 0) > 0:
-        platforms.append(z_res)
-    else:
-        logs.append(_log("⚠️  Zomato: No valid price data (scraping may have failed)"))
-    
-    if s_res.get("final_total", 0) > 0:
-        platforms.append(s_res)
-    else:
-        logs.append(_log("⚠️  Swiggy: No valid price data (scraping may have failed)"))
-    
-    if e_res.get("final_total", 0) > 0:
-        platforms.append(e_res)
-    else:
-        logs.append(_log("⚠️  EatSure: No valid price data (scraping may have failed)"))
-    
-    optimization = {"filler_suggestion": None}
-    
-    if len(platforms) == 0:
-        logs.append(_log("❌ No valid price data from any platform. Please try again."))
-        return {
-            "final_decision": {
-                "winner": "None",
-                "savings": 0,
-                "rationale": "Could not fetch prices from any platform. Please ensure you are logged in and try again.",
-            },
-            "optimization": optimization,
-            "logs": logs,
+    if "zomato" in target_platforms and not z.get("error") and z.get("final_total", 0) > 0:
+        platforms.append(z)
+    if "swiggy" in target_platforms and not s.get("error") and s.get("final_total", 0) > 0:
+        platforms.append(s)
+    if "eatsure" in target_platforms and not e.get("error") and e.get("final_total", 0) > 0:
+        platforms.append(e)
+
+    if not platforms:
+        # Build a human-readable error including per-platform errors
+        error_details = []
+        for key, res in [("Zomato", z), ("Swiggy", s), ("EatSure", e)]:
+            if res.get("error"):
+                error_details.append(f"{key}: {res['error'][:80]}")
+        detail_str = "; ".join(error_details) if error_details else "No data returned"
+        decision = {
+            "winner": "None",
+            "savings": 0,
+            "rationale": (
+                f"Could not fetch live prices. Details: {detail_str}. "
+                "Make sure you're connected to Zomato/Swiggy via the Accounts tab."
+            ),
         }
-    
-    # ── Filler item optimization ──
-    # Common discount thresholds on Zomato/Swiggy/EatSure
-    discount_thresholds = [200, 300, 500, 750, 1000]
-    
-    for platform in platforms:
-        base = platform.get("base_price", 0)
-        for threshold in discount_thresholds:
-            gap = threshold - base
-            if 0 < gap <= 100:
-                # Within ₹100 of a discount threshold — suggest filler
-                logs.append(
-                    _log(
-                        f"🧠 Optimizer: {platform['platform']} cart is ₹{base}, "
-                        f"only ₹{gap} away from ₹{threshold} discount tier! "
-                        f"Consider adding a cheap item like Gulab Jamun (≈₹{gap}) "
-                        f"to unlock a bigger discount."
-                    )
-                )
-                optimization["filler_suggestion"] = {
-                    "platform": platform["platform"],
-                    "current_total": base,
-                    "threshold": threshold,
-                    "gap": gap,
-                    "suggestion": f"Add a ≈₹{gap} item (e.g., Gulab Jamun, Raita, Papad) to reach ₹{threshold} and unlock more savings",
-                }
-                break
-    
-    # ── Find the winner ──
-    sorted_platforms = sorted(platforms, key=lambda x: x.get("final_total", 9999))
-    winner = sorted_platforms[0]
-    
-    savings = 0
-    if len(sorted_platforms) > 1:
-        runner_up = sorted_platforms[1]
-        savings = runner_up.get("final_total", 0) - winner.get("final_total", 0)
-    
-    # Build rationale
-    rationale_parts = [f"{winner['platform']} offers the best deal at ₹{winner['final_total']}."]
-    
+        logs.append(_log("❌ No valid price data from any platform"))
+        return {"final_decision": decision, "optimization": {}, "logs": logs}
+
+    sorted_p = sorted(platforms, key=lambda x: x.get("final_total", 9999))
+    winner = sorted_p[0]
+    savings = (sorted_p[1].get("final_total", 0) - winner.get("final_total", 0)) if len(sorted_p) > 1 else 0
+
+    # Format item-level prices if available
+    item_prices = winner.get("item_prices", {})
+    item_lines = [f"{k}: ₹{v}" for k, v in item_prices.items()]
+
+    rationale_parts = [f"{winner['platform']} has the best price at ₹{winner['final_total']}."]
+    if item_lines:
+        rationale_parts.append("Item prices: " + ", ".join(item_lines) + ".")
     if savings > 0:
-        rationale_parts.append(f"You save ₹{savings} compared to the next option.")
-    
+        rationale_parts.append(f"Saves ₹{savings} vs next platform.")
     if winner.get("membership"):
-        rationale_parts.append(f"Your {winner['membership']} membership contributed to this price.")
-    
+        rationale_parts.append(f"{winner['membership']} membership applied.")
     if winner.get("coupon_applied"):
-        rationale_parts.append(f"Coupon '{winner['coupon_applied']}' was applied.")
-    
-    if winner.get("delivery_time") and winner["delivery_time"] != "N/A":
-        rationale_parts.append(f"Estimated delivery: {winner['delivery_time']}.")
-    
+        rationale_parts.append(f"Coupon '{winner['coupon_applied']}' used.")
+
     decision = {
         "winner": winner["platform"],
         "base_price": winner.get("base_price", 0),
@@ -403,67 +426,124 @@ async def node_optimizer(state: AgentState) -> Dict[str, Any]:
         "delivery_time": winner.get("delivery_time", "N/A"),
         "savings": savings,
         "rationale": " ".join(rationale_parts),
-    }
-    
-    logs.append(_log(
-        f"🏆 Winner: {decision['winner']} at ₹{decision['final_total']} "
-        f"(saving ₹{savings})"
-    ))
-    logs.append(_log(f"✅ Decision Ready — {decision['rationale']}"))
-    
-    return {
-        "final_decision": decision,
-        "optimization": optimization,
-        "logs": logs,
+        "item_prices": winner.get("item_prices", {}),
     }
 
+    logs.append(_log(f"🏆 Winner: {decision['winner']} at ₹{decision['final_total']} (saves ₹{savings})"))
+    return {"final_decision": decision, "optimization": {}, "logs": logs}
 
-# ──────────────────────────────────────────────
-# Build the LangGraph State Machine
-# ──────────────────────────────────────────────
+
+# ── LangGraph Setup ───────────────────────────────────────────────────────────
 workflow = StateGraph(AgentState)
 workflow.add_node("intent", node_intent)
 workflow.add_node("scrape", node_scrape)
 workflow.add_node("optimizer", node_optimizer)
-
 workflow.set_entry_point("intent")
 workflow.add_edge("intent", "scrape")
 workflow.add_edge("scrape", "optimizer")
 workflow.add_edge("optimizer", END)
-
 agent_graph = workflow.compile()
 
 
-# ──────────────────────────────────────────────
-# Public Runner (Async Generator for WebSocket streaming)
-# ──────────────────────────────────────────────
+# ── Public Runner ─────────────────────────────────────────────────────────────
 async def run_omnifood_agent(query: str) -> AsyncGenerator[Dict[str, Any], None]:
     """
-    Run the OmniFood agent and yield log messages + final result
-    as they become available. Designed for WebSocket streaming.
+    Run the OmniFood agent and yield log + result messages for WebSocket streaming.
     """
-    inputs = {"query": query, "logs": []}
-    accumulated_state = {}
-    
+    route = _classify_query(query)
+    logger.info(f"Query classified as: {route['mode']} | platforms: {route['platforms']}")
+
+    # ── Direct chat answer ────────────────────────────────────────────────
+    if route["mode"] == "general_chat":
+        yield _log("💬 Answering as general chat...")
+        answer = await _answer_general_query(query)
+        yield {"type": "result", "data": {"mode": "chat", "answer": answer}}
+        return
+
+    if route["mode"] == "account_summary":
+        yield _log("🔐 Checking saved platform connections...")
+        summary = _build_account_summary(route["platforms"] or None)
+        yield _log(summary["answer"])
+        yield {"type": "result", "data": summary}
+        return
+
+    # ── food_lookup: run live scraper ─────────────────────────────────────
+    bm = BrowserManager()
+    live_ok, live_reason = await bm.can_scrape_live()
+    if not live_ok:
+        yield _log(f"⚠️ Live scraping unavailable: {live_reason}")
+        yield {
+            "type": "result",
+            "data": {
+                "mode": "chat",
+                "answer": (
+                    f"Live scraping is currently unavailable ({live_reason}). "
+                    "Please make sure Playwright is installed: `pip install playwright && python -m playwright install chromium`"
+                ),
+            },
+        }
+        return
+
+    target_platforms = route["platforms"] or ["zomato", "swiggy"]
+    inputs = {
+        "query": query,
+        "logs": [],
+        "target_platforms": target_platforms,
+        "browser_manager": bm,
+    }
+    accumulated_state: Dict[str, Any] = {}
+
     try:
         async for output in agent_graph.astream(inputs):
             for node_name, state_update in output.items():
                 accumulated_state.update(state_update)
-                # Stream each log message individually
+
                 if "logs" in state_update:
                     for log_entry in state_update["logs"]:
                         yield log_entry
-                        await asyncio.sleep(0.15)  # Small delay for streaming UX
-                
-                # Emit the final result
+                        await asyncio.sleep(0.1)
+
                 if "final_decision" in state_update:
+                    decision = accumulated_state.get("final_decision", {})
+                    z_res = accumulated_state.get("zomato_result", {})
+                    s_res = accumulated_state.get("swiggy_result", {})
+                    e_res = accumulated_state.get("eatsure_result", {})
+
+                    # Build a rich natural-language answer
+                    items = accumulated_state.get("intent", {}).get("items", [])
+                    item_names = [it["name"] if isinstance(it, dict) else it for it in items]
+
+                    if decision["winner"] == "None":
+                        answer = decision["rationale"]
+                    else:
+                        lines = []
+                        for res in [z_res, s_res, e_res]:
+                            if not res.get("error") and res.get("final_total", 0) > 0:
+                                platform = res["platform"]
+                                price_parts = []
+                                for iname, iprice in res.get("item_prices", {}).items():
+                                    price_parts.append(f"{iname}: ₹{iprice}")
+                                if price_parts:
+                                    lines.append(f"**{platform}** — " + ", ".join(price_parts))
+                                else:
+                                    lines.append(f"**{platform}** — ₹{res['final_total']} total")
+                        if lines:
+                            answer = "Here are the live prices I found:\n\n" + "\n".join(lines)
+                            if decision["savings"] > 0:
+                                answer += f"\n\n✅ **{decision['winner']} is cheapest**, saving you ₹{decision['savings']}."
+                        else:
+                            answer = decision["rationale"]
+
                     yield {
                         "type": "result",
                         "data": {
-                            "zomato": accumulated_state.get("zomato_result", {}),
-                            "swiggy": accumulated_state.get("swiggy_result", {}),
-                            "eatsure": accumulated_state.get("eatsure_result", {}),
-                            "decision": accumulated_state.get("final_decision", {}),
+                            "mode": "comparison" if len(target_platforms) > 1 else "platform_summary",
+                            "answer": answer,
+                            "target_platforms": target_platforms,
+                            "zomato": z_res,
+                            "swiggy": s_res,
+                            "eatsure": e_res,
+                            "decision": decision,
                             "optimization": accumulated_state.get("optimization", {}),
                         },
                     }

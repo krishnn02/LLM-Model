@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     
     # Demo Mode (simulates scraping when Playwright is unavailable)
-    demo_mode: bool = True
+    demo_mode: bool = False
     
     class Config:
         env_file = ".env"

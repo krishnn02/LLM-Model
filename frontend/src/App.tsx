@@ -26,8 +26,10 @@ import LiveLogs from './components/LiveLogs'
 import DecisionCard from './components/DecisionCard'
 import HeroBadge from './components/HeroBadge'
 import FeatureCard from './components/FeatureCard'
+import ConnectedAccounts from './components/ConnectedAccounts'
 import { useAgent } from './hooks/useAgent'
 import { useHistory } from './hooks/useHistory'
+import { useSession } from './hooks/useSession'
 
 function App() {
   const [query, setQuery] = useState('')
@@ -37,6 +39,15 @@ function App() {
   const historyRef = useRef<HTMLDivElement>(null)
   const { logs, result, status, error, search, reset } = useAgent()
   const { history, addEntry, removeEntry, clearHistory } = useHistory()
+  const {
+    sessions,
+    loginStatus,
+    errors: sessionErrors,
+    startLogin,
+    confirmLogin,
+    cancelLogin,
+    disconnect,
+  } = useSession()
 
   const isSearching = status === 'connecting' || status === 'connected' || status === 'streaming'
 
@@ -78,7 +89,15 @@ function App() {
   // Save to history when done
   useEffect(() => {
     if (status === 'done' && result && query.trim()) {
-      addEntry(query.trim(), result.decision.winner)
+      const historyLabel =
+        result.mode === 'comparison'
+          ? result.decision?.winner
+          : result.mode === 'account_summary'
+            ? 'Account Summary'
+            : result.mode === 'chat'
+              ? 'Chat'
+              : result.mode
+      addEntry(query.trim(), historyLabel)
     }
   }, [status, result, query, addEntry])
 
@@ -149,6 +168,7 @@ function App() {
           </div>
           <div className="flex items-center gap-5 text-sm" style={{ color: '#8888a0' }}>
             <a href="#features" className="hover:text-white transition-colors duration-200 hidden sm:block">Features</a>
+            <a href="#accounts" className="hover:text-white transition-colors duration-200 hidden sm:block">Accounts</a>
             <a href="#how-it-works" className="hover:text-white transition-colors duration-200 hidden sm:block">How it works</a>
             <StatusBadge />
           </div>
@@ -179,7 +199,7 @@ function App() {
             </h1>
 
             <p className="text-lg mb-10 max-w-xl leading-relaxed" style={{ color: '#8888a0' }}>
-              OmniFood's AI agents scan Zomato, Swiggy & EatSure in real-time — applying your memberships, coupons, and hidden discounts to find the absolute cheapest checkout total.
+              Ask OmniFood about your linked accounts, restaurant offers, coupons, or general food questions. It will answer directly when possible and scrape live platform data when needed.
             </p>
 
             {/* ─── SEARCH BAR ─── */}
@@ -206,7 +226,7 @@ function App() {
                   onChange={(e) => setQuery(e.target.value)}
                   onKeyDown={handleKeyDown}
                   onFocus={() => { if (history.length > 0 && !isSearching) setShowHistory(true) }}
-                  placeholder='Try "2 Butter Chicken + Naan from Punjabi Tadka to 400001"'
+                  placeholder='Ask about offers, account details, or a food order...'
                   disabled={isSearching}
                   className="flex-1 bg-transparent outline-none text-base placeholder:text-[#555570]"
                   style={{ color: '#e8e8ed', fontFamily: 'var(--font-sans)' }}
@@ -253,7 +273,7 @@ function App() {
                     }}
                     id="search-button"
                   >
-                    {isSearching ? 'Scanning...' : 'Find Deals'}
+                    {isSearching ? 'Scanning...' : 'Ask OmniFood'}
                     {!isSearching && <ArrowRight size={16} />}
                   </button>
                 )}
@@ -368,7 +388,7 @@ function App() {
                 Why OmniFood?
               </h2>
               <p className="text-base" style={{ color: '#8888a0' }}>
-                Three AI agents working in parallel to save you money on every order.
+                Link your accounts once, get personalized deals on every order.
               </p>
             </motion.div>
             <div className="grid md:grid-cols-3 gap-6">
@@ -386,11 +406,26 @@ function App() {
               />
               <FeatureCard
                 icon={<Truck size={28} />}
-                title="Membership Aware"
-                description="Loads your Zomato Gold / Swiggy One session to include your personal member-only benefits in the price comparison."
+                title="Your Accounts, Your Deals"
+                description="Log in to Zomato, Swiggy & EatSure through OmniFood — we use your authenticated session to fetch offers, coupons & memberships specific to your phone number."
                 delay={0.3}
               />
             </div>
+          </div>
+        </section>
+
+        {/* ─── CONNECTED ACCOUNTS ─── */}
+        <section id="accounts" className="px-6 py-16">
+          <div style={{ maxWidth: '896px', marginLeft: 'auto', marginRight: 'auto' }}>
+            <ConnectedAccounts
+              sessions={sessions}
+              loginStatus={loginStatus}
+              errors={sessionErrors}
+              onConnect={startLogin}
+              onConfirm={confirmLogin}
+              onCancel={cancelLogin}
+              onDisconnect={disconnect}
+            />
           </div>
         </section>
 
@@ -408,7 +443,7 @@ function App() {
               <div style={{ maxWidth: '1024px', marginLeft: 'auto', marginRight: 'auto' }}>
                 <div className="flex items-center gap-3 mb-8">
                   <Sparkles size={22} style={{ color: '#6c63ff' }} />
-                  <h2 className="text-2xl font-bold" style={{ color: '#e8e8ed' }}>Agent Activity</h2>
+                  <h2 className="text-2xl font-bold" style={{ color: '#e8e8ed' }}>OmniFood Response</h2>
                   {isSearching && (
                     <span className="text-xs px-2 py-1 rounded-full animate-pulse" style={{ background: 'rgba(108,99,255,0.15)', color: '#6c63ff' }}>
                       Live
@@ -466,11 +501,12 @@ function App() {
             </motion.div>
             <div className="space-y-6">
               {[
-                { step: '01', title: 'You Describe Your Order', desc: 'Type naturally — "2 Paneer Tikka from Barbeque Nation to Andheri West"' },
-                { step: '02', title: 'AI Parses Intent', desc: 'Our LLM extracts the restaurant, items, and delivery address into a structured schema.' },
-                { step: '03', title: 'Stealth Browsers Launch', desc: 'Parallel headless Playwright browsers open Zomato, Swiggy & EatSure with your logged-in session.' },
-                { step: '04', title: 'Real Totals Captured', desc: 'Each agent navigates to the final checkout page, capturing taxes, fees, and member discounts.' },
-                { step: '05', title: 'Optimizer Compares & Suggests', desc: 'The optimizer finds the cheapest option and even recommends filler items for bigger discount tiers.' },
+                { step: '01', title: 'Connect Your Accounts', desc: 'Link your Zomato, Swiggy & EatSure accounts via secure browser login — your session cookies are saved locally.' },
+                { step: '02', title: 'You Describe Your Order', desc: 'Type naturally — "2 Paneer Tikka from Barbeque Nation to Andheri West"' },
+                { step: '03', title: 'AI Parses Intent', desc: 'Our LLM extracts the restaurant, items, and delivery address into a structured schema.' },
+                { step: '04', title: 'Authenticated Browsers Launch', desc: 'Parallel stealth browsers open each platform using your saved sessions — accessing your personal offers, memberships & coupons.' },
+                { step: '05', title: 'Real Totals Captured', desc: 'Each agent navigates to the final checkout page, capturing taxes, fees, and member discounts specific to your account.' },
+                { step: '06', title: 'Optimizer Compares & Suggests', desc: 'The optimizer finds the cheapest option and even recommends filler items for bigger discount tiers.' },
               ].map((item, i) => (
                 <motion.div
                   key={item.step}

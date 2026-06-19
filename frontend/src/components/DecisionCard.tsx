@@ -142,32 +142,80 @@ export default function DecisionCard({ result }: DecisionCardProps) {
       <div className="flex flex-col gap-3">
         <div className="flex items-center gap-2">
           <Trophy size={16} style={{ color: '#ffd700' }} />
-          <span className="text-sm font-semibold" style={{ color: '#e8e8ed' }}>Decision Card</span>
+          <span className="text-sm font-semibold" style={{ color: '#e8e8ed' }}>OmniFood Response</span>
         </div>
         <div className="glass-card flex items-center justify-center h-[420px]">
           <p className="text-sm" style={{ color: '#555570' }}>
-            Price comparison will appear here...
+            Ask about account details, restaurant offers, or general food questions...
           </p>
         </div>
       </div>
     )
   }
 
-  const { zomato, swiggy, eatsure, decision } = result
+  const mode = result.mode || 'comparison'
+  const { zomato, swiggy, eatsure, decision, answer } = result
   const safeDecision = decision || { winner: 'None', savings: 0, rationale: '' }
   const hasSavings = safeDecision.savings > 0 && safeDecision.winner !== 'None'
+  const visibleTargets = result.target_platforms?.length ? result.target_platforms.map((p) => p.toLowerCase()) : ['zomato', 'swiggy', 'eatsure']
+
+  if (mode === 'chat' || mode === 'account_summary') {
+    return (
+      <div className="flex flex-col gap-3">
+        <div className="flex items-center gap-2">
+          <Trophy size={16} style={{ color: '#ffd700' }} />
+          <span className="text-sm font-semibold" style={{ color: '#e8e8ed' }}>OmniFood Response</span>
+        </div>
+
+        <motion.div
+          initial={{ opacity: 0, y: 15 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.4 }}
+          className="glass-card p-5"
+        >
+          <div className="flex items-center gap-2 mb-3">
+            <span className="text-xs px-2 py-1 rounded-full" style={{ background: 'rgba(108,99,255,0.12)', color: '#6c63ff' }}>
+              {mode === 'account_summary' ? 'Account Summary' : 'Chat Answer'}
+            </span>
+          </div>
+          <p className="text-sm leading-relaxed" style={{ color: '#e8e8ed' }}>
+            {answer || 'No response generated.'}
+          </p>
+        </motion.div>
+      </div>
+    )
+  }
 
   return (
     <div className="flex flex-col gap-3">
       <div className="flex items-center gap-2">
-        <Trophy size={16} style={{ color: '#ffd700' }} />
-        <span className="text-sm font-semibold" style={{ color: '#e8e8ed' }}>Decision Card</span>
+          <Trophy size={16} style={{ color: '#ffd700' }} />
+        <span className="text-sm font-semibold" style={{ color: '#e8e8ed' }}>OmniFood Response</span>
       </div>
 
       <div className="space-y-4">
-        <PlatformRow data={zomato} isWinner={safeDecision.winner === 'Zomato'} />
-        <PlatformRow data={swiggy} isWinner={safeDecision.winner === 'Swiggy'} />
-        <PlatformRow data={eatsure} isWinner={safeDecision.winner === 'EatSure'} />
+        {mode === 'platform_summary' && answer && (
+          <motion.div
+            initial={{ opacity: 0, y: 12 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.35 }}
+            className="glass-card p-4"
+          >
+            <p className="text-sm leading-relaxed" style={{ color: '#e8e8ed' }}>
+              {answer}
+            </p>
+          </motion.div>
+        )}
+
+        {(visibleTargets.includes('zomato') || mode === 'comparison') && (
+          <PlatformRow data={zomato} isWinner={safeDecision.winner === 'Zomato'} />
+        )}
+        {(visibleTargets.includes('swiggy') || mode === 'comparison') && (
+          <PlatformRow data={swiggy} isWinner={safeDecision.winner === 'Swiggy'} />
+        )}
+        {(visibleTargets.includes('eatsure') || mode === 'comparison') && (
+          <PlatformRow data={eatsure} isWinner={safeDecision.winner === 'EatSure'} />
+        )}
 
         {/* Savings summary */}
         {hasSavings ? (
@@ -218,7 +266,7 @@ export default function DecisionCard({ result }: DecisionCardProps) {
           >
             <AlertTriangle size={20} className="mx-auto mb-2" style={{ color: '#ff6b6b' }} />
             <p className="text-sm" style={{ color: '#ff6b6b' }}>
-              {safeDecision.rationale}
+              {safeDecision.rationale || answer || 'No result available.'}
             </p>
           </motion.div>
         )}

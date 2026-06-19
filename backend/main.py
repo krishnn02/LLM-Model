@@ -12,10 +12,14 @@ import sys
 from contextlib import asynccontextmanager
 from datetime import datetime
 
-# ── Fix for Python 3.14+ on Windows ──
-# Python 3.14 changed asyncio subprocess internals; Playwright needs ProactorEventLoop
 if platform.system() == "Windows":
-    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    try:
+        # In Python 3.14, Proactor is default, but we set it explicitly 
+        # to ensure compatibility with Playwright subprocesses.
+        if not isinstance(asyncio.get_event_loop_policy(), asyncio.WindowsProactorEventLoopPolicy):
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except Exception:
+        pass
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,6 +27,7 @@ from pydantic import BaseModel, Field
 
 from config import get_settings
 from agent import run_omnifood_agent
+from session_manager import get_session_manager
 
 # ── Logging Setup ──
 settings = get_settings()
@@ -37,35 +42,17 @@ logger = logging.getLogger("omnifood.server")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Python 3.14 + Uvicorn on Windows sets SelectorEventLoop; Playwright needs ProactorEventLoop
-    if platform.system() == "Windows":
-        try:
-            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-        except Exception:
-            pass
-            
     logger.info("OmniFood Agent API starting up...")
     logger.info(f"LLM Provider: {settings.llm_provider}")
     logger.info(f"Headless Mode: {settings.headless}")
+    logger.info(f"Demo Mode: {settings.demo_mode}")
     logger.info(f"CORS Origins: {settings.cors_origins}")
     
-    # Check if Playwright browsers are installed
-    try:
-        from playwright.async_api import async_playwright
-        pw = await async_playwright().start()
-        try:
-            browser = await pw.chromium.launch(headless=True)
-            await browser.close()
-            logger.info("Playwright browsers: OK ✓")
-        finally:
-            await pw.stop()
-    except NotImplementedError:
-        logger.warning("Playwright subprocess check skipped (Python 3.14 async compat)")
-        logger.info("Playwright will work at runtime with ProactorEventLoop policy.")
-    except Exception as e:
-        logger.warning(f"Playwright browsers may not be installed: {e}")
-        logger.warning("Run: python -m playwright install chromium")
+    import asyncio
+    loop = asyncio.get_running_loop()
+    logger.info(f"Current Asyncio Loop: {type(loop)}")
     
+    logger.info("Playwright availability is checked per-request (not at startup).")
     yield
     logger.info("OmniFood Agent API shutting down...")
 
@@ -90,6 +77,9 @@ app.add_middleware(
 # ── Models ──
 class QueryRequest(BaseModel):
     query: str = Field(..., min_length=3, max_length=500, description="Natural language food order query")
+
+class PlatformRequest(BaseModel):
+    platform: str = Field(..., description="Platform key: zomato, swiggy, or eatsure")
 
 class HealthResponse(BaseModel):
     status: str
@@ -139,6 +129,66 @@ async def search_food(request: QueryRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── Session Management Endpoints ──
+@app.get("/api/sessions")
+async def get_sessions():
+    """
+    Get the connection status of all platform sessions.
+    Returns which platforms the user is logged into and their details.
+    """
+    sm = get_session_manager()
+    sessions = sm.get_all_sessions_status()
+    return {"success": True, "sessions": sessions}
+
+
+@app.post("/api/sessions/login")
+async def start_login(request: PlatformRequest):
+    """
+    Start a login flow for a platform.
+    Opens a visible browser window where the user can log in.
+    """
+    sm = get_session_manager()
+    result = await sm.start_login(request.platform.lower())
+    if not result["success"]:
+        raise HTTPException(status_code=400, detail=result.get("error", "Login failed"))
+    return result
+
+
+@app.post("/api/sessions/confirm")
+async def confirm_login(request: PlatformRequest):
+    """
+    Confirm that the user has logged in via the visible browser.
+    Saves the session state (cookies, tokens) for future scraping.
+    """
+    sm = get_session_manager()
+    result = await sm.confirm_login(request.platform.lower())
+    if not result["success"]:
+        raise HTTPException(status_code=400, detail=result.get("error", "Confirmation failed"))
+    return result
+
+
+@app.post("/api/sessions/cancel")
+async def cancel_login(request: PlatformRequest):
+    """
+    Cancel an in-progress login and close the browser window.
+    """
+    sm = get_session_manager()
+    result = await sm.cancel_login(request.platform.lower())
+    return result
+
+
+@app.post("/api/sessions/disconnect")
+async def disconnect_session(request: PlatformRequest):
+    """
+    Disconnect a platform session. Removes saved cookies and session data.
+    """
+    sm = get_session_manager()
+    result = await sm.disconnect(request.platform.lower())
+    if not result["success"]:
+        raise HTTPException(status_code=400, detail=result.get("error", "Disconnect failed"))
+    return result
+
+
 # ── WebSocket Endpoint ──
 @app.websocket("/ws/agent")
 async def websocket_agent(websocket: WebSocket):
@@ -153,6 +203,16 @@ async def websocket_agent(websocket: WebSocket):
     logger.info(f"WebSocket client connected: {client_id}")
     
     try:
+        # Send session status as first message
+        sm = get_session_manager()
+        sessions = sm.get_all_sessions_status()
+        connected_platforms = [k for k, v in sessions.items() if v.get("connected")]
+        await websocket.send_json({
+            "type": "sessions",
+            "data": sessions,
+            "connected": connected_platforms,
+        })
+
         # Receive the query
         data = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
         request_data = json.loads(data)
@@ -203,11 +263,16 @@ async def websocket_agent(websocket: WebSocket):
 
 
 if __name__ == "__main__":
+    if platform.system() == "Windows":
+        # Force Proactor loop policy for Playwright compatibility
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+        
     import uvicorn
     uvicorn.run(
         "main:app",
         host=settings.host,
         port=settings.port,
-        reload=True,
+        reload=False,  # Reload mode forces SelectorLoop on Windows, which breaks Playwright
         log_level=settings.log_level.lower(),
+        loop="asyncio"
     )

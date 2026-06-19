@@ -63,7 +63,7 @@ class BrowserManager:
         if not PLAYWRIGHT_AVAILABLE:
             return False, "Playwright library not installed — run: pip install playwright"
         if self.settings.demo_mode:
-            return False, "DEMO_MODE=true in .env"
+            return True, "Demo Mode Active"
         # Check chromium binary exists (avoids subprocess call that fails on Python 3.14)
         import shutil
         import subprocess
@@ -460,7 +460,7 @@ class BrowserManager:
         """Scan search results page for the best matching restaurant link."""
         try:
             await page.wait_for_load_state("domcontentloaded", timeout=10000)
-            all_links = await page.locator(f'a[href*="{domain.split(".")[0]}"], a[href*="restaurant"]').all()
+            all_links = await page.locator("a[href]").all()
             restaurant_lower = restaurant.lower()
             
             ignore_words = {"restaurant", "cafe", "hotel", "diner", "food", "the", "and"}
@@ -469,13 +469,18 @@ class BrowserManager:
                 search_words = [restaurant_lower.split()[0]]
                 
             # First pass: look for exact word match in text or href
-            for link in all_links[:30]:
+            for link in all_links[:100]:
                 href = await link.get_attribute("href") or ""
                 text = (await link.text_content() or "").lower()
+                
+                # Exclude common non-restaurant links
+                if any(skip in href.lower() for skip in ['/about', '/contact', '/privacy', '/terms', '/login']):
+                    continue
+                    
                 if any(word in text for word in search_words) or any(word in href.lower() for word in search_words):
                     if href.startswith("http"):
                         return href
-                    return f"https://{domain}{href}"
+                    return f"https://{domain}{href}" if href.startswith("/") else f"https://{domain}/{href}"
         except Exception as e:
             logger.warning(f"find_restaurant_link error: {e}")
         return None

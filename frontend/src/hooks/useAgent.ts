@@ -6,7 +6,7 @@
 import { useState, useRef, useCallback } from 'react'
 import type { LogMessage, AgentResult, ConnectionStatus } from '../types'
 
-const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws/agent'
+const WS_URL = import.meta.env.VITE_WS_URL as string
 
 interface UseAgentReturn {
   logs: LogMessage[]
